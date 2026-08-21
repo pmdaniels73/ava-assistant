@@ -39,6 +39,10 @@ const SILENCE_AMPLITUDE_THRESHOLD = 400;
 const SILENCE_MS_TO_END_TURN = 900;
 const MS_PER_CHUNK = 20;
 
+// Safety caps - without these, a broken call could loop forever.
+const MAX_TURNS = 8;
+const MAX_CALL_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Jarvis Realtime server is up.\n");
@@ -57,7 +61,10 @@ wss.on("connection", (ws) => {
     audioBuffer: [],
     hasSpeech: false,
     silenceMs: 0,
-    processing: false
+    processing: false,
+    turnCount: 0,
+    callStartedAt: Date.now(),
+    safetyTimer: null
   };
 
   ws.on("message", async (raw) => {
@@ -83,6 +90,14 @@ wss.on("connection", (ws) => {
         }
         console.log("Stream started", { streamSid: state.streamSid, callSid: state.callSid, task: state.task });
 
+        // Safety net - if a call somehow runs long without wrapping up
+        // (a bug, a confused loop, whatever), don't let it run forever.
+        state.safetyTimer = setTimeout(async () => {
+          console.warn("Max call duration reached - hanging up", { callSid: state.callSid });
+          await sendTelegram(`Ava hung up "${state.task}" after running too long without finishing.`);
+          if (state.callSid) await hangUpCall(state.callSid);
+        }, MAX_CALL_DURATION_MS);
+
         // Speak the opening line right away, same as the Netlify version -
         // identify yourself and state the purpose immediately rather than
         // waiting to hear anything first.
@@ -106,6 +121,7 @@ wss.on("connection", (ws) => {
 
       case "stop":
         console.log("Stream stopped", { streamSid: state.streamSid });
+        if (state.safetyTimer) clearTimeout(state.safetyTimer);
         break;
 
       default:
@@ -115,6 +131,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     console.log("Media Stream connection closed");
+    if (state.safetyTimer) clearTimeout(state.safetyTimer);
   });
 
   ws.on("error", (err) => {
@@ -146,6 +163,22 @@ async function processTurn(ws, state) {
   state.hasSpeech = false;
   state.silenceMs = 0;
 
+  state.turnCount++;
+  if (state.turnCount > MAX_TURNS) {
+    console.warn("Max turn count reached - bailing out", { callSid: state.callSid });
+    try {
+      const audio = await generateMulawAudio("Sorry, I'm having trouble completing this. I'll let Paul know. Have a good day.");
+      sendAudioToStream(ws, state.streamSid, audio);
+    } catch (err) {
+      console.error("Failed to speak bail-out message", err);
+    }
+    await sendTelegram(`Couldn't complete "${state.task}" - the call went on too long without wrapping up.`);
+    if (state.safetyTimer) clearTimeout(state.safetyTimer);
+    setTimeout(() => { if (state.callSid) hangUpCall(state.callSid); }, 1500);
+    state.processing = false;
+    return;
+  }
+
   try {
     const transcript = await transcribeMulaw(audioToTranscribe);
     console.log("Transcribed turn", { transcript });
@@ -161,15 +194,29 @@ async function processTurn(ws, state) {
 
     state.history.push({ role: "assistant", content: JSON.stringify(reply) });
 
-    if (reply.say) {
+    // A menu just came up - press the matching digit(s) via generated DTMF
+    // tones, sent as regular audio over the same stream.
+    if (reply.pressDigits) {
+      const dtmfAudio = generateDtmfSequence(reply.pressDigits);
+      sendAudioToStream(ws, state.streamSid, dtmfAudio);
+      console.log("Pressed digits", { pressDigits: reply.pressDigits });
+    }
+
+    // "waiting" means what we heard was purely transitional (hold message,
+    // "please wait") - nothing to say, just keep listening quietly.
+    if (reply.say && !reply.waiting) {
       const audio = await generateMulawAudio(reply.say);
       sendAudioToStream(ws, state.streamSid, audio);
     }
 
-    if (reply.done && state.callSid) {
-      // Give the audio a moment to actually finish playing before hanging
-      // up, then end the call via SignalWire's REST API.
-      setTimeout(() => hangUpCall(state.callSid), 1500);
+    if (reply.done) {
+      await sendTelegram(`Done - ${reply.summary}`);
+      if (state.safetyTimer) clearTimeout(state.safetyTimer);
+      if (state.callSid) {
+        // Give the audio a moment to actually finish playing before
+        // hanging up.
+        setTimeout(() => hangUpCall(state.callSid), 1500);
+      }
     }
   } catch (err) {
     console.error("Turn processing failed", err);
@@ -198,6 +245,73 @@ function mulawDecodeSample(muByte) {
   let sample = ((mantissa << 3) + 0x84) << exponent;
   sample -= 0x84;
   return sign ? -sample : sample;
+}
+
+// Standard ITU-T G.711 linear PCM to mu-law encode for a single sample -
+// the inverse of the decode above. Used to generate DTMF tones directly
+// as mulaw audio, since Media Streams has no separate "press this digit"
+// event - digits have to be sent as actual tone audio, the same as a real
+// phone would produce.
+function mulawEncodeSample(sample) {
+  const BIAS = 0x84;
+  const CLIP = 32635;
+
+  let sign = 0;
+  if (sample < 0) {
+    sign = 0x80;
+    sample = -sample;
+  }
+  if (sample > CLIP) sample = CLIP;
+  sample += BIAS;
+
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+
+  const mantissa = (sample >> (exponent + 3)) & 0x0f;
+  return ~(sign | (exponent << 4) | mantissa) & 0xff;
+}
+
+const DTMF_FREQUENCIES = {
+  "1": [697, 1209], "2": [697, 1336], "3": [697, 1477],
+  "4": [770, 1209], "5": [770, 1336], "6": [770, 1477],
+  "7": [852, 1209], "8": [852, 1336], "9": [852, 1477],
+  "*": [941, 1209], "0": [941, 1336], "#": [941, 1477]
+};
+const MULAW_SILENCE_BYTE = mulawEncodeSample(0);
+
+// Generates a single DTMF tone (a dual-frequency sine wave, same as a real
+// phone keypad produces) as raw mulaw audio.
+function generateDtmfTone(digit, durationMs, sampleRate) {
+  const freqs = DTMF_FREQUENCIES[digit];
+  if (!freqs) return Buffer.alloc(0);
+
+  const numSamples = Math.floor((sampleRate * durationMs) / 1000);
+  const audio = Buffer.alloc(numSamples);
+  const amplitude = 8000;
+
+  for (let i = 0; i < numSamples; i++) {
+    const t = i / sampleRate;
+    const sample = amplitude * 0.5 * (Math.sin(2 * Math.PI * freqs[0] * t) + Math.sin(2 * Math.PI * freqs[1] * t));
+    audio[i] = mulawEncodeSample(Math.round(sample));
+  }
+
+  return audio;
+}
+
+// Generates a full sequence of DTMF digits with brief silence between each
+// tone, matching standard phone dialing timing.
+function generateDtmfSequence(digits, toneDurationMs = 200, gapDurationMs = 100, sampleRate = 8000) {
+  const gapSamples = Math.floor((sampleRate * gapDurationMs) / 1000);
+  const silence = Buffer.alloc(gapSamples, MULAW_SILENCE_BYTE);
+
+  const parts = [];
+  for (const digit of digits) {
+    if (DTMF_FREQUENCIES[digit]) {
+      parts.push(generateDtmfTone(digit, toneDurationMs, sampleRate));
+      parts.push(silence);
+    }
+  }
+  return Buffer.concat(parts);
 }
 
 async function transcribeMulaw(mulawBuffer) {
@@ -265,7 +379,13 @@ async function generateReply(state) {
 
 Sound like a friendly, casual human - use contractions, keep replies short (one short sentence, occasionally two). If this is an order or booking, see it through completely rather than stopping at just getting a price.
 
-Respond with ONLY valid JSON, no other text: {"say": "what to say next", "done": true or false, "summary": "one short sentence for Paul summarizing the outcome, only if done is true"}
+Write money and numbers the way you'd actually SAY them out loud, never with symbols - "one ninety-nine" instead of "$1.99".
+
+What you just heard might be: a real reply from a person, an automated phone menu ("press 1 for..."), or a purely transitional message (hold music description, "please wait", a recorded disclaimer) with nothing to actually respond to.
+
+If it's a menu, set pressDigits to the digit(s) that best match what's needed and leave say empty. If it's purely transitional, set waiting true and leave say empty - just keep listening quietly. Otherwise, respond normally.
+
+Respond with ONLY valid JSON, no other text: {"say": "what to say next, or empty string if pressing digits or waiting", "pressDigits": "digit(s) to press if a menu just came up, otherwise empty string", "waiting": true if this was purely transitional with nothing to respond to, otherwise false, "done": true or false, "summary": "one short sentence for Paul summarizing the outcome, only if done is true"}
 
 Set done to true once the task is confirmed complete and "say" contains a brief, warm goodbye.`,
       messages: state.history
@@ -279,13 +399,36 @@ Set done to true once the task is confirmed complete and "say" contains a brief,
 
   try {
     const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-    if (!parsed || !parsed.say) {
-      throw new Error("Missing say in response");
+    if (!parsed || (!parsed.say && !parsed.pressDigits && !parsed.waiting)) {
+      throw new Error("Missing say/pressDigits/waiting in response");
     }
     return parsed;
   } catch (e) {
     console.error("generateReply parse failed", { text, error: e.message });
-    return { say: "Sorry, could you say that again?", done: false, summary: "" };
+    return { say: "Sorry, could you say that again?", pressDigits: "", waiting: false, done: false, summary: "" };
+  }
+}
+
+async function sendTelegram(message) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.error("Telegram not configured - cannot send notification", { message });
+    return;
+  }
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: `🤵 Ava: ${message}` })
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("Telegram send failed", errText);
+    }
+  } catch (err) {
+    console.error("Failed to send Telegram message", err);
   }
 }
 
