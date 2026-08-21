@@ -43,7 +43,18 @@ const MS_PER_CHUNK = 20;
 const MAX_TURNS = 8;
 const MAX_CALL_DURATION_MS = 5 * 60 * 1000; // 5 minutes
 
+// Keeps a record of the most recent Telegram send attempt, viewable
+// directly at /debug/telegram - a way to check what actually happened
+// that doesn't depend on the console log stream, in case that's dropping
+// or delaying certain lines.
+let lastTelegramAttempt = { note: "No attempt made yet since last restart." };
+
 const server = http.createServer((req, res) => {
+  if (req.url === "/debug/telegram") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(lastTelegramAttempt, null, 2));
+    return;
+  }
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Jarvis Realtime server is up.\n");
 });
@@ -414,12 +425,16 @@ Set done to true once the task is confirmed complete and "say" contains a brief,
 async function sendTelegram(message) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
+  lastTelegramAttempt = { step: "starting", message, hasToken: !!token, hasChatId: !!chatId, timestamp: new Date().toISOString() };
+
   if (!token || !chatId) {
+    lastTelegramAttempt = { step: "not_configured", message, hasToken: !!token, hasChatId: !!chatId, timestamp: new Date().toISOString() };
     console.error("Telegram not configured - cannot send notification", { message, hasToken: !!token, hasChatId: !!chatId });
     return;
   }
 
   try {
+    lastTelegramAttempt = { step: "fetching", message, timestamp: new Date().toISOString() };
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -430,11 +445,14 @@ async function sendTelegram(message) {
     // blocked, chat not found) - the body's own "ok" field is the real
     // signal, not just the HTTP status.
     if (!res.ok || !data.ok) {
+      lastTelegramAttempt = { step: "failed", message, httpStatus: res.status, response: data, timestamp: new Date().toISOString() };
       console.error("Telegram send failed", { httpStatus: res.status, response: data });
     } else {
+      lastTelegramAttempt = { step: "success", message, response: data, timestamp: new Date().toISOString() };
       console.log("Telegram message sent successfully", { message });
     }
   } catch (err) {
+    lastTelegramAttempt = { step: "exception", message, error: err.message, stack: err.stack, timestamp: new Date().toISOString() };
     console.error("Failed to send Telegram message", err);
   }
 }
