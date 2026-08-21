@@ -56,7 +56,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Jarvis Realtime server is up.\n");
+  res.end("Jarvis Realtime server is up. VERSION-CHECK-2.\n");
 });
 
 const wss = new WebSocket.Server({ server, path: "/media-stream" });
