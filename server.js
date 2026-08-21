@@ -50,7 +50,7 @@ const MAX_CALL_DURATION_MS = 5 * 60 * 1000; // 5 minutes
 let lastTelegramAttempt = { note: "No attempt made yet since last restart." };
 
 const server = http.createServer((req, res) => {
-  if (req.url === "/debug/telegram") {
+  if (req.url.startsWith("/debug/telegram")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(lastTelegramAttempt, null, 2));
     return;
