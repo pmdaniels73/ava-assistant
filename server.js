@@ -8,10 +8,11 @@
 // call is happening, no request/response round trips per turn.
 //
 // Tonight's milestone: prove the pipeline works end to end - receive real
-// call audio, generate a spoken test phrase via Azure TTS in the exact
-// format SignalWire expects, and stream it back so it's actually heard on
-// the call. The full AI conversation loop (streaming speech recognition +
-// streaming Claude responses) is the next phase, built on top of this.
+// call audio, generate a spoken test phrase via Google Cloud Text-to-Speech
+// in the exact format SignalWire expects, and stream it back so it's
+// actually heard on the call. The full AI conversation loop (streaming
+// speech recognition + streaming Claude responses) is the next phase,
+// built on top of this.
 
 const http = require("http");
 const WebSocket = require("ws");
@@ -83,36 +84,39 @@ wss.on("connection", (ws) => {
   });
 });
 
-// Generates speech via Azure TTS directly in 8kHz mulaw format, which is
-// exactly what SignalWire's Media Streams expects for outbound audio - no
-// format conversion needed on our end.
+// Generates speech via Google Cloud Text-to-Speech directly in 8kHz mulaw
+// format, which is exactly what SignalWire's Media Streams expects for
+// outbound audio - no format conversion needed on our end.
 async function generateMulawAudio(text) {
-  const key = process.env.AZURE_SPEECH_KEY;
-  const region = process.env.AZURE_SPEECH_REGION;
-  if (!key || !region) {
-    throw new Error("AZURE_SPEECH_KEY / AZURE_SPEECH_REGION not configured");
+  const apiKey = process.env.GOOGLE_TTS_API_KEY;
+  if (!apiKey) {
+    throw new Error("GOOGLE_TTS_API_KEY not configured");
   }
 
-  const ssml = `<speak version='1.0' xml:lang='en-US'><voice xml:lang='en-US' name='en-US-AvaNeural'>${escapeSsml(text)}</voice></speak>`;
-
-  const res = await fetch(`https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`, {
+  const res = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${apiKey}`, {
     method: "POST",
-    headers: {
-      "Ocp-Apim-Subscription-Key": key,
-      "Content-Type": "application/ssml+xml",
-      "X-Microsoft-OutputFormat": "raw-8khz-8bit-mono-mulaw",
-      "User-Agent": "JarvisRealtime"
-    },
-    body: ssml
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      input: { text },
+      voice: { languageCode: "en-US", name: "en-US-Neural2-F" },
+      audioConfig: { audioEncoding: "MULAW", sampleRateHertz: 8000 }
+    })
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Azure TTS failed: ${errText}`);
+    throw new Error(`Google TTS failed: ${errText}`);
   }
 
-  const arrayBuffer = await res.arrayBuffer();
-  return Buffer.from(arrayBuffer);
+  const data = await res.json();
+  if (!data.audioContent) {
+    throw new Error(`Google TTS response missing audioContent: ${JSON.stringify(data)}`);
+  }
+
+  // Google returns the audio base64-encoded inside a JSON wrapper (unlike
+  // some providers that return raw binary directly) - decode it to get the
+  // actual raw mulaw bytes.
+  return Buffer.from(data.audioContent, "base64");
 }
 
 // Sends raw mulaw audio to SignalWire in properly-sized chunks, per the
@@ -128,12 +132,6 @@ function sendAudioToStream(ws, streamSid, audioBuffer) {
     };
     ws.send(JSON.stringify(message));
   }
-}
-
-function escapeSsml(str) {
-  return String(str).replace(/[<>&'"]/g, c => ({
-    "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;"
-  }[c]));
 }
 
 server.listen(PORT, () => {
