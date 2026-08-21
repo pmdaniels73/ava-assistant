@@ -413,7 +413,7 @@ async function sendTelegram(message) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) {
-    console.error("Telegram not configured - cannot send notification", { message });
+    console.error("Telegram not configured - cannot send notification", { message, hasToken: !!token, hasChatId: !!chatId });
     return;
   }
 
@@ -423,9 +423,14 @@ async function sendTelegram(message) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text: `🤵 Ava: ${message}` })
     });
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error("Telegram send failed", errText);
+    const data = await res.json();
+    // Telegram can return HTTP 200 while still failing logically (e.g. bot
+    // blocked, chat not found) - the body's own "ok" field is the real
+    // signal, not just the HTTP status.
+    if (!res.ok || !data.ok) {
+      console.error("Telegram send failed", { httpStatus: res.status, response: data });
+    } else {
+      console.log("Telegram message sent successfully", { message });
     }
   } catch (err) {
     console.error("Failed to send Telegram message", err);
