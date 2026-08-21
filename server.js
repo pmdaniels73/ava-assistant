@@ -210,7 +210,9 @@ async function processTurn(ws, state) {
     }
 
     if (reply.done) {
+      console.log("About to call sendTelegram");
       await sendTelegram(`Done - ${reply.summary}`);
+      console.log("sendTelegram call completed");
       if (state.safetyTimer) clearTimeout(state.safetyTimer);
       if (state.callSid) {
         // Give the audio a moment to actually finish playing before
